@@ -1,0 +1,477 @@
+commit 4698bfc235c20e955466b6362df2a39f7478c13f
+Author: Johannes Berg <johannes@sipsolutions.net>
+Date:   Mon Aug 24 12:53:34 2009 +0200
+
+    separate commands into sections
+    
+    The ad-hoc way of parsing the command "tree" didn't
+    really work out, so separate the commands better
+    into sections and parse by that.
+
+diff --git a/Makefile b/Makefile
+index e356ae4..cb5fcc1 100644
+--- a/Makefile
++++ b/Makefile
+@@ -18,6 +18,7 @@ OBJS = iw.o genl.o event.o info.o phy.o \
+ 	interface.o ibss.o station.o util.o \
+ 	mesh.o mpath.o scan.o reg.o version.o \
+ 	reason.o status.o connect.o link.o
++OBJS += sections.o
+ ALL = iw
+ 
+ NL1FOUND := $(shell $(PKG_CONFIG) --atleast-version=1 libnl-1 && echo Y)
+diff --git a/connect.c b/connect.c
+index 91be62a..ced289f 100644
+--- a/connect.c
++++ b/connect.c
+@@ -67,7 +67,6 @@ static int disconnect(struct nl80211_state *state,
+ TOPLEVEL(disconnect, NULL,
+ 	NL80211_CMD_DISCONNECT, 0, CIB_NETDEV, disconnect,
+ 	"Disconnect from the current network.");
+-HIDDEN(conn, establish, "", NL80211_CMD_CONNECT, 0, CIB_NETDEV, iw_conn);
+ 
+ static int iw_connect(struct nl80211_state *state, struct nl_cb *cb,
+ 		      struct nl_msg *msg, int argc, char **argv)
+@@ -97,7 +96,7 @@ static int iw_connect(struct nl80211_state *state, struct nl_cb *cb,
+ 	if (!conn_argv)
+ 		return -ENOMEM;
+ 	conn_argv[0] = dev;
+-	conn_argv[1] = "conn";
++	conn_argv[1] = "connect";
+ 	conn_argv[2] = "establish";
+ 	for (i = 0; i < argc; i++)
+ 		conn_argv[i + 3] = argv[i];
+@@ -138,3 +137,4 @@ TOPLEVEL(connect, "[-w] <SSID> [<freq in MHz>] [<bssid>] [key 0:abcde d:1:616263
+ 	0, 0, CIB_NETDEV, iw_connect,
+ 	"Join the network with the given SSID (and frequency, BSSID).\n"
+ 	"With -w, wait for the connect to finish or fail.");
++HIDDEN(connect, establish, "", NL80211_CMD_CONNECT, 0, CIB_NETDEV, iw_conn);
+diff --git a/ibss.c b/ibss.c
+index 8785e7a..4715ac8 100644
+--- a/ibss.c
++++ b/ibss.c
+@@ -9,6 +9,8 @@
+ #include "nl80211.h"
+ #include "iw.h"
+ 
++SECTION(ibss);
++
+ static int join_ibss(struct nl80211_state *state,
+ 		     struct nl_cb *cb,
+ 		     struct nl_msg *msg,
+diff --git a/info.c b/info.c
+index 1b5e443..7bca69d 100644
+--- a/info.c
++++ b/info.c
+@@ -282,7 +282,7 @@ static int handle_info(struct nl80211_state *state,
+ 
+ 	return 0;
+ }
+-TOPLEVEL(info, NULL, NL80211_CMD_GET_WIPHY, 0, CIB_PHY, handle_info,
++__COMMAND(NULL, info, "info", NULL, NL80211_CMD_GET_WIPHY, 0, 0, CIB_PHY, handle_info,
+ 	 "Show capabilities for the specified wireless device.");
+ TOPLEVEL(list, NULL, NL80211_CMD_GET_WIPHY, NLM_F_DUMP, CIB_NONE, handle_info,
+ 	 "List all wireless devices and their capabilities.");
+diff --git a/interface.c b/interface.c
+index d3f6e2d..bf1335a 100644
+--- a/interface.c
++++ b/interface.c
+@@ -18,6 +18,8 @@
+ 			"otherbss: show frames from other BSSes\n"\
+ 			"cook:     use cooked mode"
+ 
++SECTION(interface);
++
+ static char *mntr_flags[NL80211_MNTR_FLAG_MAX + 1] = {
+ 	"none",
+ 	"fcsfail",
+diff --git a/iw.c b/iw.c
+index 2525492..8fcf2f6 100644
+--- a/iw.c
++++ b/iw.c
+@@ -94,12 +94,17 @@ static void nl80211_cleanup(struct nl80211_state *state)
+ 	nl_socket_free(state->nl_sock);
+ }
+ 
+-__COMMAND(NULL, NULL, "", NULL, 0, 0, 0, CIB_NONE, NULL, NULL);
+-__COMMAND(NULL, NULL, "", NULL, 1, 0, 0, CIB_NONE, NULL, NULL);
+-
+ static int cmd_size;
+ 
+-static void __usage_cmd(struct cmd *cmd, char *indent, bool full)
++extern struct cmd __start___cmd;
++extern struct cmd __stop___cmd;
++
++#define for_each_cmd(_cmd)					\
++	for (_cmd = &__start___cmd; _cmd < &__stop___cmd;		\
++	     _cmd = (const struct cmd *)((char *)_cmd + cmd_size))
++
++
++static void __usage_cmd(const struct cmd *cmd, char *indent, bool full)
+ {
+ 	const char *start, *lend, *end;
+ 
+@@ -115,8 +120,8 @@ static void __usage_cmd(struct cmd *cmd, char *indent, bool full)
+ 		printf("dev <devname> ");
+ 		break;
+ 	}
+-	if (cmd->section)
+-		printf("%s ", cmd->section);
++	if (cmd->parent && cmd->parent->name)
++		printf("%s ", cmd->parent->name);
+ 	printf("%s", cmd->name);
+ 	if (cmd->args)
+ 		printf(" %s", cmd->args);
+@@ -156,17 +161,26 @@ static const char *argv0;
+ 
+ static void usage(bool full)
+ {
+-	struct cmd *cmd;
++	const struct cmd *section, *cmd;
+ 
+ 	printf("Usage:\t%s [options] command\n", argv0);
+ 	usage_options();
+ 	printf("\t--version\tshow version (%s)\n", iw_version);
+ 	printf("Commands:\n");
+-	for (cmd = &__start___cmd; cmd < &__stop___cmd;
+-	     cmd = (struct cmd *)((char *)cmd + cmd_size)) {
+-		if (!cmd->handler || cmd->hidden)
++	for_each_cmd(section) {
++		if (section->parent)
+ 			continue;
+-		__usage_cmd(cmd, "\t", full);
++
++		if (section->handler && !section->hidden)
++			__usage_cmd(section, "\t", full);
++
++		for_each_cmd(cmd) {
++			if (section != cmd->parent)
++				continue;
++			if (!cmd->handler || cmd->hidden)
++				continue;
++			__usage_cmd(cmd, "\t", full);
++		}
+ 	}
+ 	printf("\nYou can omit the 'phy' or 'dev' if "
+ 			"the identification is unique,\n"
+@@ -186,7 +200,7 @@ static int print_help(struct nl80211_state *state,
+ TOPLEVEL(help, NULL, 0, 0, CIB_NONE, print_help,
+ 	 "Print usage for each command.");
+ 
+-static void usage_cmd(struct cmd *cmd)
++static void usage_cmd(const struct cmd *cmd)
+ {
+ 	printf("Usage:\t%s [options] ", argv0);
+ 	__usage_cmd(cmd, "", true);
+@@ -238,9 +252,9 @@ static int ack_handler(struct nl_msg *msg, void *arg)
+ }
+ 
+ static int __handle_cmd(struct nl80211_state *state, enum id_input idby,
+-			int argc, char **argv, struct cmd **cmdout)
++			int argc, char **argv, const struct cmd **cmdout)
+ {
+-	struct cmd *cmd, *match = NULL;
++	const struct cmd *cmd, *match = NULL, *sectcmd;
+ 	struct nl_cb *cb;
+ 	struct nl_msg *msg;
+ 	int devidx = 0;
+@@ -285,44 +299,61 @@ static int __handle_cmd(struct nl80211_state *state, enum id_input idby,
+ 	if (devidx < 0)
+ 		return -errno;
+ 
+-	section = command = *argv;
++	section = *argv;
+ 	argc--;
+ 	argv++;
+ 
+-	for (cmd = &__start___cmd; cmd < &__stop___cmd;
+-	     cmd = (struct cmd *)((char *)cmd + cmd_size)) {
+-		if (!cmd->handler)
++	for_each_cmd(sectcmd) {
++		if (sectcmd->parent)
+ 			continue;
+-		if (cmd->idby != command_idby)
++		/* ok ... bit of a hack for the dupe 'info' section */
++		if (match && sectcmd->idby != command_idby)
+ 			continue;
+-		if (cmd->section) {
+-			if (strcmp(cmd->section, section))
++		if (strcmp(sectcmd->name, section) == 0)
++			match = sectcmd;
++	}
++
++	sectcmd = match;
++	match = NULL;
++	if (!sectcmd)
++		return 1;
++
++	if (argc > 0) {
++		command = *argv;
++
++		for_each_cmd(cmd) {
++			if (!cmd->handler)
+ 				continue;
+-			/* this is a bit icky ... */
+-			if (command == section) {
+-				if (argc <= 0) {
+-					if (match)
+-						break;
+-					return 1;
+-				}
+-				command = *argv;
+-				argc--;
+-				argv++;
+-			}
+-		} else if (section != command)
+-			continue;
+-		if (strcmp(cmd->name, command))
+-			continue;
+-		if (argc && !cmd->args)
+-			continue;
++			if (cmd->parent != sectcmd)
++				continue;
++			if (cmd->idby != command_idby)
++				continue;
++			if (strcmp(cmd->name, command))
++				continue;
++			if (argc > 1 && !cmd->args)
++				continue;
++			match = cmd;
++			break;
++		}
+ 
+-		match = cmd;
++		if (match) {
++			argc--;
++			argv++;
++		}
+ 	}
+ 
+-	cmd = match;
+-
+-	if (!cmd)
+-		return 1;
++	if (match)
++		cmd = match;
++	else {
++		/* Use the section itself, if possible. */
++		cmd = sectcmd;
++		if (argc && !cmd->args)
++			return 1;
++		if (cmd->idby != command_idby)
++			return 1;
++		if (!cmd->handler)
++			return 1;
++	}
+ 
+ 	if (cmdout)
+ 		*cmdout = cmd;
+@@ -396,11 +427,10 @@ int main(int argc, char **argv)
+ {
+ 	struct nl80211_state nlstate;
+ 	int err;
+-	struct cmd *cmd = NULL;
++	const struct cmd *cmd = NULL;
+ 
+ 	/* calculate command size including padding */
+-	cmd_size = abs((long)&__cmd_NULL_NULL_1_CIB_NONE_0
+-	             - (long)&__cmd_NULL_NULL_0_CIB_NONE_0);
++	cmd_size = abs((long)&__section_set - (long)&__section_get);
+ 	/* strip off self */
+ 	argc--;
+ 	argv0 = *argv++;
+diff --git a/iw.h b/iw.h
+index 94948ec..511a1db 100644
+--- a/iw.h
++++ b/iw.h
+@@ -35,7 +35,6 @@ enum id_input {
+ };
+ 
+ struct cmd {
+-	const char *section;
+ 	const char *name;
+ 	const char *args;
+ 	const char *help;
+@@ -52,6 +51,7 @@ struct cmd {
+ 		       struct nl_cb *cb,
+ 		       struct nl_msg *msg,
+ 		       int argc, char **argv);
++	const struct cmd *parent;
+ };
+ 
+ #define ARRAY_SIZE(ar) (sizeof(ar)/sizeof(ar[0]))
+@@ -60,7 +60,6 @@ struct cmd {
+ 	static const struct cmd						\
+ 	__cmd ## _ ## _symname ## _ ## _handler ## _ ## _nlcmd ## _ ## _idby ## _ ## _hidden\
+ 	__attribute__((used)) __attribute__((section("__cmd")))	= {	\
+-		.section = (_section),					\
+ 		.name = (_name),					\
+ 		.args = (_args),					\
+ 		.cmd = (_nlcmd),					\
+@@ -69,15 +68,34 @@ struct cmd {
+ 		.idby = (_idby),					\
+ 		.handler = (_handler),					\
+ 		.help = (_help),					\
++		.parent = _section,					\
+ 	 }
+ #define COMMAND(section, name, args, cmd, flags, idby, handler, help)	\
+-	__COMMAND(#section, name, #name, args, cmd, flags, 0, idby, handler, help)
++	__COMMAND(&(__section ## _ ## section), name, #name, args, cmd, flags, 0, idby, handler, help)
+ #define HIDDEN(section, name, args, cmd, flags, idby, handler)		\
+-	__COMMAND(#section, name, #name, args, cmd, flags, 1, idby, handler, NULL)
+-#define TOPLEVEL(name, args, cmd, flags, idby, handler, help)		\
+-	__COMMAND(NULL, name, #name, args, cmd, flags, 0, idby, handler, help)
+-extern struct cmd __start___cmd;
+-extern struct cmd __stop___cmd;
++	__COMMAND(&(__section ## _ ## section), name, #name, args, cmd, flags, 1, idby, handler, NULL)
++
++#define TOPLEVEL(_name, _args, _nlcmd, _flags, _idby, _handler, _help)	\
++	const struct cmd						\
++	__section ## _ ## _name						\
++	__attribute__((used)) __attribute__((section("__cmd")))	= {	\
++		.name = (#_name),					\
++		.args = (_args),					\
++		.cmd = (_nlcmd),					\
++		.nl_msg_flags = (_flags),				\
++		.idby = (_idby),					\
++		.handler = (_handler),					\
++		.help = (_help),					\
++	 }
++#define SECTION(_name)							\
++	const struct cmd __section ## _ ## _name			\
++	__attribute__((used)) __attribute__((section("__cmd"))) = {	\
++		.name = (#_name),					\
++		.hidden = 1,						\
++	}
++
++#define DECLARE_SECTION(_name)						\
++	extern const struct cmd __section ## _ ## _name;
+ 
+ extern const char iw_version[];
+ 
+@@ -125,4 +143,8 @@ enum print_ie_type {
+ void print_ies(unsigned char *ie, int ielen, bool unknown,
+ 	       enum print_ie_type ptype);
+ 
++
++DECLARE_SECTION(set);
++DECLARE_SECTION(get);
++
+ #endif /* __IW_H */
+diff --git a/link.c b/link.c
+index 03acf58..c17f055 100644
+--- a/link.c
++++ b/link.c
+@@ -105,8 +105,6 @@ static int handle_scan_for_link(struct nl80211_state *state,
+ 	nl_cb_set(cb, NL_CB_VALID, NL_CB_CUSTOM, link_bss_handler, &lr);
+ 	return 0;
+ }
+-HIDDEN(link, get_bss, NULL, NL80211_CMD_GET_SCAN, NLM_F_DUMP,
+-	CIB_NETDEV, handle_scan_for_link);
+ 
+ static int print_link_sta(struct nl_msg *msg, void *arg)
+ {
+@@ -213,8 +211,6 @@ static int handle_link_sta(struct nl80211_state *state,
+  nla_put_failure:
+ 	return -ENOBUFS;
+ }
+-HIDDEN(link, get_sta, "", NL80211_CMD_GET_STATION, 0,
+-	CIB_NETDEV, handle_link_sta);
+ 
+ static int handle_link(struct nl80211_state *state, struct nl_cb *cb,
+ 		       struct nl_msg *msg, int argc, char **argv)
+@@ -255,3 +251,7 @@ static int handle_link(struct nl80211_state *state, struct nl_cb *cb,
+ }
+ TOPLEVEL(link, NULL, 0, 0, CIB_NETDEV, handle_link,
+ 	 "Print information about the current link, if any.");
++HIDDEN(link, get_sta, "", NL80211_CMD_GET_STATION, 0,
++	CIB_NETDEV, handle_link_sta);
++HIDDEN(link, get_bss, NULL, NL80211_CMD_GET_SCAN, NLM_F_DUMP,
++	CIB_NETDEV, handle_scan_for_link);
+diff --git a/mpath.c b/mpath.c
+index d590cff..e848481 100644
+--- a/mpath.c
++++ b/mpath.c
+@@ -11,6 +11,8 @@
+ #include "nl80211.h"
+ #include "iw.h"
+ 
++SECTION(mpath);
++
+ enum plink_state {
+ 	LISTEN,
+ 	OPN_SNT,
+diff --git a/reg.c b/reg.c
+index a6bd74c..7f82e08 100644
+--- a/reg.c
++++ b/reg.c
+@@ -12,6 +12,8 @@
+ #include "nl80211.h"
+ #include "iw.h"
+ 
++SECTION(reg);
++
+ #define MHZ_TO_KHZ(freq) ((freq) * 1000)
+ #define KHZ_TO_MHZ(freq) ((freq) / 1000)
+ #define DBI_TO_MBI(gain) ((gain) * 100)
+diff --git a/scan.c b/scan.c
+index b2d986b..9941775 100644
+--- a/scan.c
++++ b/scan.c
+@@ -108,10 +108,6 @@ static int handle_scan(struct nl80211_state *state,
+ 	nlmsg_free(freqs);
+ 	return err;
+ }
+-COMMAND(scan, trigger, "[freq <freq>*] [ssid <ssid>*|passive]",
+-	NL80211_CMD_TRIGGER_SCAN, 0, CIB_NETDEV, handle_scan,
+-	 "Trigger a scan on the given frequencies with probing for the given\n"
+-	 "SSIDs (or wildcard if not given) unless passive scanning is requested.");
+ 
+ static void tab_on_first(bool *first)
+ {
+@@ -877,10 +873,6 @@ static int handle_scan_dump(struct nl80211_state *state,
+ 		  &scan_params);
+ 	return 0;
+ }
+-COMMAND(scan, dump, "[-u]",
+-	NL80211_CMD_GET_SCAN, NLM_F_DUMP, CIB_NETDEV, handle_scan_dump,
+-	"Dump the current scan results. If -u is specified, print unknown\n"
+-	"data in scan results.");
+ 
+ static int handle_scan_combined(struct nl80211_state *state,
+ 				struct nl_cb *cb,
+@@ -959,3 +951,11 @@ TOPLEVEL(scan, "[-u] [freq <freq>*] [ssid <ssid>*|passive]", 0, 0,
+ 	 "Scan on the given frequencies and probe for the given SSIDs\n"
+ 	 "(or wildcard if not given) unless passive scanning is requested.\n"
+ 	 "If -u is specified print unknown data in the scan results.");
++COMMAND(scan, dump, "[-u]",
++	NL80211_CMD_GET_SCAN, NLM_F_DUMP, CIB_NETDEV, handle_scan_dump,
++	"Dump the current scan results. If -u is specified, print unknown\n"
++	"data in scan results.");
++COMMAND(scan, trigger, "[freq <freq>*] [ssid <ssid>*|passive]",
++	NL80211_CMD_TRIGGER_SCAN, 0, CIB_NETDEV, handle_scan,
++	 "Trigger a scan on the given frequencies with probing for the given\n"
++	 "SSIDs (or wildcard if not given) unless passive scanning is requested.");
+diff --git a/sections.c b/sections.c
+new file mode 100644
+index 0000000..38095f6
+--- /dev/null
++++ b/sections.c
+@@ -0,0 +1,4 @@
++#include "iw.h"
++
++SECTION(get);
++SECTION(set);
+diff --git a/station.c b/station.c
+index 33a9cad..0fff92d 100644
+--- a/station.c
++++ b/station.c
+@@ -11,6 +11,8 @@
+ #include "nl80211.h"
+ #include "iw.h"
+ 
++SECTION(station);
++
+ enum plink_state {
+ 	LISTEN,
+ 	OPN_SNT,
